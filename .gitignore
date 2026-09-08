@@ -1,10 +1,10 @@
 .env
 .env.*
 !.env.example
-models/
-templates/
-cache/
-logs/
+/models/
+/templates/
+/cache/
+/logs/
 __pycache__/
 *.pyc
 *.safetensors
