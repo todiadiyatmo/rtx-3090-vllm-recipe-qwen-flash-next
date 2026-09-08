@@ -1,0 +1,123 @@
+# Run from the repository root with --project-directory "$PWD" --env-file .env.
+# Separate project name; never reuse the serving stack's Compose project name.
+name: rtx3090x4-qwen38-recipe
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-local/qwen38-flash-next:e962733e-ampere-pp}
+    build:
+      context: ./recipe/patch
+      dockerfile: Dockerfile
+    # Fail visibly on first deployment; enable automatic restart only after testing.
+    restart: "no"
+    init: true
+    runtime: nvidia
+    ipc: host
+    # Required by the tested PLE offload CUDA IPC path (pidfd_getfd).
+    # These relax container isolation; use only on a trusted host.
+    cap_add: [SYS_PTRACE]
+    security_opt: [seccomp=unconfined]
+    shm_size: "16gb"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1', '2', '3']
+              capabilities: [gpu]
+    volumes:
+      - type: bind
+        source: ${MODEL_DIR:?Set MODEL_DIR to a complete checkpoint}
+        target: /models/model
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CHAT_TEMPLATE:?Set CHAT_TEMPLATE to Sharp v22.4.0}
+        target: /models/qwen38-sharp-v22.4.0.jinja
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./cache/huggingface:/root/.cache/huggingface
+      - ./cache/torch_compile-e962733e:/root/.cache/vllm/torch_compile_cache
+      - ./cache/triton:/root/.triton/cache
+      - ./cache/torch_kernels:/root/.cache/torch
+    environment:
+      VLLM_API_KEY: ${VLLM_API_KEY:?Set a nonempty VLLM_API_KEY in .env}
+      VLLM_LOGGING_LEVEL: INFO
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      CUDA_VISIBLE_DEVICES: "0,1,2,3"
+      VLLM_PLE_CPU_OFFLOAD: "1"
+      VLLM_PLE_OFFLOAD_READY_TIMEOUT: "3600"
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NCCL_CUMEM_ENABLE: "0"
+      NCCL_P2P_DISABLE: ${NCCL_P2P_DISABLE:-0}
+      NCCL_P2P_LEVEL: ${NCCL_P2P_LEVEL:-SYS}
+      NCCL_MIN_NCHANNELS: "4"
+      NCCL_MAX_NCHANNELS: "4"
+      VLLM_NO_USAGE_STATS: "1"
+      OMP_NUM_THREADS: "1"
+    command:
+      - /models/model
+      - --quantization
+      - inc
+      - --served-model-name
+      - ${SERVED_MODEL_NAME:-qwen38-flash-next}
+      - --dtype
+      - bfloat16
+      - --tensor-parallel-size
+      - "2"
+      - --pipeline-parallel-size
+      - "2"
+      - --enable-expert-parallel
+      - --max-model-len
+      - "262144"
+      - --gpu-memory-utilization
+      - ${GPU_MEMORY_UTILIZATION:-0.94}
+      - --max-num-seqs
+      - "3"
+      - --max-num-batched-tokens
+      - "1024"
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --enable-prefix-caching
+      - --mamba-cache-mode
+      - align
+      - --enable-prompt-tokens-details
+      - --enable-chunked-prefill
+      - --disable-custom-all-reduce
+      # No speculative decoding / MTP in this PP2 profile.
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--override-generation-config={"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0}'
+      # Matches the current measured W4A16-Attn8-FP8PLE profile: vision ON, bounded.
+      - '--limit-mm-per-prompt={"image":2}'
+      - '--mm-processor-kwargs={"max_pixels":1048576}'
+      - --chat-template
+      - /models/qwen38-sharp-v22.4.0.jinja
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "${HOST_IP:-127.0.0.1}:${HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: [CMD, curl, -sf, http://localhost:8000/health]
+      interval: 15s
+      timeout: 5s
+      retries: 120
+      start_period: 2400s
