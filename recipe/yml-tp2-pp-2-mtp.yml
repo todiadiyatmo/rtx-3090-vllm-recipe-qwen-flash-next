@@ -1,3 +1,4 @@
+# TP2 x PP2 with MTP (2 draft tokens). Same as yml-tp2-pp-2.yml plus --speculative-config.
 # Run from the repository root with --project-directory "$PWD" --env-file .env.
 # Separate project name; never reuse the serving stack's Compose project name.
 name: rtx3090x4-qwen38-recipe
@@ -96,7 +97,9 @@ services:
       - --enable-prompt-tokens-details
       - --enable-chunked-prefill
       - --disable-custom-all-reduce
-      # No speculative decoding: largest KV pool. For MTP use recipe/yml-tp2-pp-2-mtp.yml.
+      # MTP speculative decoding, 2 draft tokens. Needs the checkpoint revision with mtp-model-*.safetensors.
+      # Cost: KV pool about 45% smaller than without MTP. Gain: decode about +56% prose / +91% code (measured, C=1).
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - '--override-generation-config={"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0}'
       # Vision on, bounded. The limit counts images in the whole prompt; 8 costs no KV pool (measured).

@@ -1,9 +1,10 @@
-# Exact base used for the September 5-6, 2026 validation.
-FROM vllm/vllm-openai:nightly-e962733e08d10f7ca65dac4df99e116460b8b174@sha256:89dd8f442a3f4c08c6b3cd634c4f735cd709160651c296596673cf974ea6ee39
+# Exact base used for the September 12-13, 2026 validation (Task 85/86).
+FROM vllm/vllm-openai:nightly-eed1f3d0c6043bd494424a22443ee198dd56f657@sha256:d0742e7e31b16c85c9e215960604452f5f172a522d35c94ca42b7030cb0afa36
 
-# Complete replacement files from the tested overlay. Do not also apply the diff.
+# Complete replacement files from the tested overlay (9 files). Do not also apply the diff.
 COPY overlay/vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY LICENSE.vllm /usr/local/share/licenses/qwen38-recipe/LICENSE.vllm
-LABEL id.tonjoo.patches="55375,53899,54846,ampere-kv-fp8-bytes,54709-pp-gate,54793,54795,inc-fp8-ple-gate" \
-      id.tonjoo.base="e962733e08d10f7ca65dac4df99e116460b8b174" \
-      id.tonjoo.base_digest="sha256:89dd8f442a3f4c08c6b3cd634c4f735cd709160651c296596673cf974ea6ee39"
+LABEL id.tonjoo.patches="54846,ampere-kv-fp8-bytes,ampere-ple-fp8-uint8,54709-pp-gate,54793,54795,mtp-pp-mirror-46994" \
+      id.tonjoo.base="eed1f3d0c6043bd494424a22443ee198dd56f657" \
+      id.tonjoo.base_digest="sha256:d0742e7e31b16c85c9e215960604452f5f172a522d35c94ca42b7030cb0afa36" \
+      id.tonjoo.recipe="v1.1.0-eed1f3d0"
