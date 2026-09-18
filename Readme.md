@@ -56,7 +56,7 @@ DFlash and DSpark are not available for this model in vLLM.
 
 ## vLLM patches
 
-The base image is stock; the overlay replaces 9 source files (full detail, upstream links and rebase notes in
+The base image is stock; the overlay replaces 11 source files (full detail, upstream links and rebase notes in
 [`recipe/patch/README.md`](recipe/patch/README.md)):
 
 | Change | Purpose |
@@ -68,12 +68,14 @@ The base image is stock; the overlay replaces 9 source files (full detail, upstr
 | [#54793](https://github.com/vllm-project/vllm/pull/54793) | Handle empty KV groups under PP. |
 | [#54795](https://github.com/vllm-project/vllm/pull/54795) | Intersect compatible KV layouts across workers. |
 | **Local mirror of [#46994](https://github.com/vllm-project/vllm/pull/46994) for `qwen4_exp`** | Upstream enables MTP under PP but fixes the draft head only for `qwen3_5_mtp`. Without this 3-line fix the `qwen4_exp` drafter skips its `fc` projections on the last stage. |
+| [#55506](https://github.com/vllm-project/vllm/pull/55506), **still open upstream** | Index the mamba spec-decode block tables by request slot, not batch row. Without it, PP + MTP + prefix caching poisons recurrent state and a share of requests loop on one token forever. Added after the v1.1.0 validation and measured on its own — see [Known failure modes](#known-failure-modes). |
 
 Already in the base (patches in the previous recipe, not needed any more): #53899 host-resident PLE table, FP8 PLE table
 loading with `--quantization inc`, #55375 fused-PLE stride fix, #55745 draft-broadcast stream guard, #46994 MTP under PP.
 
-`recipe/patch/SHA256SUMS` records the overlay hashes and `recipe/patch/nightly-eed1f3d0-flashnext-mtp.patch` is the same
-change as a unified diff for audit/rebase (the Dockerfile copies the overlay and does **not** apply the diff; do not do both).
+`recipe/patch/SHA256SUMS` records the overlay hashes; `nightly-eed1f3d0-flashnext-mtp.patch` (9 files) and
+`pr55506-mamba-spec-block-table-req-slot.patch` (2 files) are the same changes as unified diffs for audit/rebase (the
+Dockerfile copies the overlay and does **not** apply the diffs; do not do both).
 
 ```bash
 docker build -t local/qwen38-flash-next:eed1f3d0-ampere-pp-mtp recipe/patch
@@ -148,11 +150,12 @@ because its main bottleneck is reading model weights from GPU memory, not transf
 | Indexer workspace | 128 MiB | `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128` (upstream default 512 MiB does not fit the ~1 GiB margin) |
 | All-reduce / NCCL | NCCL, P2P allowed | `--disable-custom-all-reduce` (no NVLink), `NCCL_P2P_DISABLE=0`, `NCCL_P2P_LEVEL=SYS`, `NCCL_CUMEM_ENABLE=0`, 4 channels |
 | Allocator | expandable segments | both `PYTORCH_ALLOC_CONF` and `PYTORCH_CUDA_ALLOC_CONF` (torch 2.13 and vLLM read different names) |
-| Chat template | Sharp v22.4.0 | `--chat-template /models/qwen38-sharp-v22.4.0.jinja` |
+| Chat template | Sharp v22.4.0 | `--chat-template /models/qwen38-sharp-v22.4.0.jinja`. This is what the reference results were measured with. The author's own deployment moved to [froggeric v22.5](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) on 15 Sep 2026; that template scored 66/75 on the same suite (inside the 66–69 spread of this one) but has not been re-validated across the rest of this recipe, so the recipe still pins Sharp. |
 | Parsers | reasoning `qwen3`, tools `qwen3_coder` | `--enable-auto-tool-choice`; reasoning is returned in the `reasoning` field |
 | Vision | on, bounded | `--limit-mm-per-prompt={"image":8}`, `--mm-processor-kwargs={"max_pixels":1048576}`; the limit counts images in the whole prompt; raising it from 2 to 8 did not change the KV pool |
 | Container | `ipc: host`, `SYS_PTRACE`, `seccomp=unconfined`, `shm_size 16gb` | needed by the PLE offload CUDA IPC path (`pidfd_getfd`); use on a trusted host |
 | Logging / restart | json-file 50 MB × 5, `restart: "no"` | bounded logs; failures stay visible on first deployment |
+
 
 ## Setup and run
 
@@ -247,6 +250,11 @@ For the other scripts, use a proxy that adds the
 
 Version names are internal to this repository and point at the vLLM image the recipe was built with.
 
+- **v1.2.0-eed1f3d0 — 17 Sep 2026.** Same base image and same nine files as v1.1.0, plus
+  [#55506](https://github.com/vllm-project/vllm/pull/55506) (2 files, still open upstream): it removes a
+  constant-token loop that hit 12.5% of responses at three concurrent requests, at no measurable cost to the KV
+  pool, free VRAM, decode or prefill. The reference results below were measured on v1.1.0 and re-measured on the
+  patched build within run-to-run spread, so they stand. Validated 16 Sep 2026 across five boots and 204 responses.
 - **v1.1.0-eed1f3d0 — 13 Sep 2026.** vLLM nightly `eed1f3d0` (12 Sep 2026). Overlay reduced from 22 to 9 files: host PLE
   offload, FP8 PLE loading and the MTP-under-PP fixes are now upstream. MTP speculative decoding works on TP2 × PP2
   (`yml-tp2-pp-2-mtp.yml`, 2 draft tokens): decode 132 / 160 tok/s prose / code, KV pool 527K, quality 68/75, tool calls
@@ -267,6 +275,30 @@ Version names are internal to this repository and point at the vLLM image the re
 - [noonghunna/club-3090](https://github.com/noonghunna/club-3090) — community recipes and the benchmark harness used here.
 - [aikitoria/open-gpu-kernel-modules](https://github.com/aikitoria/open-gpu-kernel-modules), building on tinygrad's work — optional driver-level P2P.
 - **todiadiyatmo / Tonjoo** — patch integration, the Ampere FP8 KV byte path and FP8 PLE lookup, the `qwen4_exp` MTP draft-head fix, the W4A16-Attn8-FP8PLE checkpoint, and validation on four RTX 3090s.
+
+
+## Known failure modes
+
+Two faults are worth knowing before you serve this recipe, because both are quiet.
+
+**A constant-token loop under concurrency.** With PP + MTP + prefix caching, a share of requests degenerate into
+one token repeated until the budget runs out (`ductductduct…`, independent of the prompt), and draft acceptance
+collapses with it. That token is what the sampler emits for an all-NaN logits row — the request's recurrent state
+has been poisoned. On sm_86 the underlying misdirected access stays mapped, so **there is no crash, no CUDA error
+and nothing in the log**; the only symptom is the answer. Measured here at **12.5% of responses** (9/72) before
+[#55506](https://github.com/vllm-project/vllm/pull/55506) and **0%** (0/132) after, Fisher exact p = 0.00006, at
+no measurable cost. The overlay includes the fix. It needs **three or more concurrent requests** to appear — a
+single-stream smoke test will not find it.
+
+**`--no-async-scheduling` does not serve on this recipe.** Upstream threads recommend that flag as a mitigation for
+MTP × hybrid-model corruption, and on tensor-parallel-only rigs it is reported at roughly no cost. On this
+pipeline-parallel configuration the second stage blocks in `irecv_tensor_dict`, gloo times out after 30 minutes and
+the engine dies: 36 of 36 requests failed in our test. Boot, warmup and CUDA-graph capture all pass first, so it
+looks healthy until the first real request. The shipped configuration sets `--async-scheduling` explicitly.
+
+**Not a failure, but worth expecting:** if you read `cached_tokens` to check prefix caching, a prompt shorter than
+one KV block (3,184 tokens here) can never register a hit. Use a prompt of at least two blocks before concluding
+that caching is broken.
 
 ## License
 
