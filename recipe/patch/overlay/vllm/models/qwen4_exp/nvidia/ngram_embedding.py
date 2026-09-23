@@ -158,6 +158,24 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
         raise NotImplementedError
 
 
+def _ple_declared_unquantized(quant_config: object, prefix: str) -> bool:
+    """True hanya bila config checkpoint sendiri menyatakan tabel PLE ini tidak terkuantisasi.
+
+    Dipakai untuk checkpoint ber-body INC/auto-round dengan tabel PLE BF16 (mis. Intel
+    W4A16-AutoRound). Konservatif: ragu apa pun -> False -> pemanggil tetap raise.
+    """
+    parser = getattr(quant_config, "config_parser", None)
+    if parser is None or not hasattr(parser, "resolve"):
+        return False
+    try:
+        # layer=None adalah stand-in yang BENAR di sini: tabel PLE bukan ParallelLMHead
+        # dan bukan fused MoE — dua-duanya satu-satunya hal yang diperiksa resolver INC
+        # pada objek layer.
+        return not parser.resolve(None, prefix).quantized
+    except Exception:
+        return False
+
+
 class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
     """Quantization interface shared by resident and pinned PLE tables."""
 
@@ -184,6 +202,16 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         ) and quant_config.is_layer_excluded(prefix):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
+            # Task 89 (gpu-1): body terkuantisasi (INC/auto-round) tetapi tabel PLE
+            # tidak. Checkpoint menyatakannya sendiri; gerbang untuk yang lain tetap.
+            if _ple_declared_unquantized(quant_config, prefix):
+                logger.info_once(
+                    "PLE embedding %s: %s declares the table unquantized, using the "
+                    "BF16 runtime method (gpu-1 Task 89)",
+                    prefix,
+                    type(quant_config).__name__,
+                )
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
                 f"{type(quant_config).__name__}"

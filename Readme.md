@@ -12,8 +12,10 @@ It is not a claim that stock vLLM or every Ampere GPU can run this model.
 - **4× RTX 3090 24 GiB**, or an equivalent Ampere-or-newer setup with 24 GiB per GPU. The reference rig runs a 200 W
   power cap per card, PCIe only (no NVLink), some cards on Gen1 x4 risers. Topology and power limits change the numbers below.
 - **Host RAM for the PLE table plus runtime overhead.** The PLE lookup table is ~95 GiB in BF16 (Intel checkpoint) and
-  ~48 GiB in FP8 (W4A16-Attn8-FP8PLE checkpoint). Measured host RAM in use: **~68 GiB** with FP8 PLE, **~120 GiB** with
-  BF16 PLE. Plan for at least **96 GiB** (FP8 PLE) or **160 GiB-class** (BF16 PLE); the reference host has 157 GiB usable.
+  ~48 GiB in FP8 (W4A16-Attn8-FP8PLE checkpoint). Measured host RAM in use: **~85 GiB** with FP8 PLE, **~149 GiB** with
+  BF16 PLE (both measured 20 Sep 2026 while serving; the BF16 figure supersedes an earlier "~120 GiB" estimate).
+  Plan for at least **96 GiB** (FP8 PLE) or **160 GiB-class** (BF16 PLE); the reference host has 157 GiB usable and
+  the BF16 table leaves only ~8 GiB of it free.
   Avoid swapping.
 - **NVMe storage**: the checkpoint is ~124 GB (W4A16-Attn8-FP8PLE, revision of 13 Sep 2026 or later) or larger (Intel), plus Docker layers and compile caches.
   Budget a few hundred GB.
@@ -33,10 +35,22 @@ It is not a claim that stock vLLM or every Ampere GPU can run this model.
 
 Two Compose files, same settings except one line:
 
+Pick the file that matches your checkpoint:
+
+| File | Checkpoint | Speculative decoding | Notes |
+|---|---|---|---|
+| [`recipe/yml-tp2-pp-2-mtp-attn8.yml`](recipe/yml-tp2-pp-2-mtp-attn8.yml) | Attn8-FP8PLE | MTP, 2 draft tokens | **The reference configuration** — what the rig serves. Vision on, `GPU_MEMORY_UTILIZATION` 0.94. |
+| [`recipe/yml-tp2-pp-2-intel-autoround.yml`](recipe/yml-tp2-pp-2-intel-autoround.yml) | Intel AutoRound | off (not available) | BF16 PLE table: **~149 GiB host RAM**, and needs the PLE gate patch. `GPU_MEMORY_UTILIZATION` 0.88 — its weights are ~0.6 GiB/rank larger. |
+
+The two generic files below take any checkpoint via `MODEL_DIR` and are what the named files above are built from:
+
 | File | Speculative decoding | Use when |
 |---|---|---|
 | [`recipe/yml-tp2-pp-2-mtp.yml`](recipe/yml-tp2-pp-2-mtp.yml) | MTP, 2 draft tokens | You want faster generation. Decode is about 1.6× (prose) to 1.9× (code) faster; the KV pool is about 45% smaller. |
 | [`recipe/yml-tp2-pp-2.yml`](recipe/yml-tp2-pp-2.yml) | off | You want the largest KV pool (about 995,000 tokens). |
+
+Intel cannot use the MTP files: it ships `model_extra_tensors.safetensors` (a BF16 draft head), not the
+`mtp-model-*.safetensors` this vLLM loads.
 
 vLLM is pinned to nightly **`eed1f3d0c6043bd494424a22443ee198dd56f657`** (12 Sep 2026, image
 `vllm/vllm-openai:nightly-eed1f3d0c604…`, digest `sha256:d0742e7e…`) plus the patches in the next section, built locally as
@@ -68,13 +82,15 @@ The base image is stock; the overlay replaces 11 source files (full detail, upst
 | [#54793](https://github.com/vllm-project/vllm/pull/54793) | Handle empty KV groups under PP. |
 | [#54795](https://github.com/vllm-project/vllm/pull/54795) | Intersect compatible KV layouts across workers. |
 | **Local mirror of [#46994](https://github.com/vllm-project/vllm/pull/46994) for `qwen4_exp`** | Upstream enables MTP under PP but fixes the draft head only for `qwen3_5_mtp`. Without this 3-line fix the `qwen4_exp` drafter skips its `fc` projections on the last stage. |
+| **Local: PLE gate for unquantized tables** | `from_quant_config` has no branch for "body quantized by INC, PLE table not quantized", so an INC/auto-round checkpoint with a BF16 PLE table (e.g. the Intel checkpoint) dies at boot with `NotImplementedError ... INCConfig`. Adds one branch that trusts the checkpoint's own INC rule (`.*ple.*` = 16-bit float); anything not provably unquantized still raises. Upstream-bound. |
 | [#55506](https://github.com/vllm-project/vllm/pull/55506), **still open upstream** | Index the mamba spec-decode block tables by request slot, not batch row. Without it, PP + MTP + prefix caching poisons recurrent state and a share of requests loop on one token forever. Added after the v1.1.0 validation and measured on its own — see [Known failure modes](#known-failure-modes). |
 
 Already in the base (patches in the previous recipe, not needed any more): #53899 host-resident PLE table, FP8 PLE table
 loading with `--quantization inc`, #55375 fused-PLE stride fix, #55745 draft-broadcast stream guard, #46994 MTP under PP.
 
-`recipe/patch/SHA256SUMS` records the overlay hashes; `nightly-eed1f3d0-flashnext-mtp.patch` (9 files) and
-`pr55506-mamba-spec-block-table-req-slot.patch` (2 files) are the same changes as unified diffs for audit/rebase (the
+`recipe/patch/SHA256SUMS` records the overlay hashes; `nightly-eed1f3d0-flashnext-mtp.patch` (9 files),
+`pr55506-mamba-spec-block-table-req-slot.patch` (2 files) and `ple-inc-bf16-gate.patch` (1 file, applies on top of the
+first) are the same changes as unified diffs for audit/rebase (the
 Dockerfile copies the overlay and does **not** apply the diffs; do not do both).
 
 ```bash
@@ -168,7 +184,7 @@ resolve the same way regardless of where the yml lives.
    cp .env.example .env      # set VLLM_API_KEY (long random), MODEL_DIR, CHAT_TEMPLATE, HOST_PORT
    mkdir -p models templates
    hf download todiadiyatmo/Qwen3.8-Flash-Next-W4A16-Attn8-FP8PLE --local-dir ./models/Qwen3.8-Flash-Next-W4A16-Attn8-FP8PLE
-   # or the Intel checkpoint (needs BF16-PLE RAM budget):
+   # or the Intel checkpoint (BF16 PLE table — needs ~149 GiB host RAM, and the PLE gate patch below):
    # hf download Intel/Qwen3.8-Flash-Next-W4A16-AutoRound --local-dir ./models/Intel-Qwen3.8-Flash-Next-W4A16-AutoRound
    ```
 
@@ -250,6 +266,19 @@ For the other scripts, use a proxy that adds the
 
 Version names are internal to this repository and point at the vLLM image the recipe was built with.
 
+- **v1.3.0-eed1f3d0 — 21 Sep 2026.** Same base image as v1.2.0, one more overlay change: the **PLE gate**
+  now accepts an unquantized PLE table on an INC-quantized checkpoint. Without it,
+  [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) —
+  the base most derivatives come from — aborts at boot with `NotImplementedError: Qwen4Exp PLE embedding does
+  not support quantization config INCConfig`. Reported by a user following this recipe; the gate came from
+  upstream, not from this overlay. It is deliberately **not** loosened into a general fallback: anything not
+  provably unquantized still raises, because a quantized PLE table silently loaded as BF16 produces wrong
+  answers with no error. Adds two checkpoint-specific Compose files
+  (`yml-tp2-pp-2-intel-autoround.yml`, `yml-tp2-pp-2-mtp-attn8.yml`) so neither checkpoint needs hand-edited
+  settings. Corrects the measured host RAM for the BF16 PLE table: **~149 GiB, not ~120 GiB** — a 128 GB host
+  will swap. Built and verified from this repository on 21 Sep 2026, both checkpoints: Intel boot 393 s,
+  KV pool 453,819 at utilization 0.88, no MTP (it ships a BF16 draft head, not `mtp-model-*.safetensors`);
+  Attn8 boot 303 s, KV pool 540,016 — identical to v1.2.0, and the new branch never executes on that path.
 - **v1.2.0-eed1f3d0 — 17 Sep 2026.** Same base image and same nine files as v1.1.0, plus
   [#55506](https://github.com/vllm-project/vllm/pull/55506) (2 files, still open upstream): it removes a
   constant-token loop that hit 12.5% of responses at three concurrent requests, at no measurable cost to the KV
