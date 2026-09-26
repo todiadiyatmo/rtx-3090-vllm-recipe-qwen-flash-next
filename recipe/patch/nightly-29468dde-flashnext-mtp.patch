@@ -1,0 +1,632 @@
+diff -ruN a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+--- a/vllm/model_executor/models/config.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/model_executor/models/config.py	2026-09-26 16:02:09.691076323 +0700
+@@ -894,12 +894,25 @@
+             )
+         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
+         # engine from loading weights first.
++        # vllm#54709: PLE only needs raw input_ids on the rank that owns a PLE
++        # layer. Allow PP>1 as long as every PLE layer lives on pipeline rank 0.
+         if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+-            raise NotImplementedError(
+-                "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
+-                "because non-first pipeline ranks do not receive the raw input_ids "
+-                "it needs. Please run with PP=1."
++            from vllm.distributed.utils import get_pp_indices
++
++            rank0_start, rank0_end = get_pp_indices(
++                int(text_config.num_hidden_layers),
++                0,
++                parallel_config.pipeline_parallel_size,
+             )
++            ple_idx = [int(i) - 1 for i in text_config.ple_layer_ids]
++            if min(ple_idx) < rank0_start or max(ple_idx) >= rank0_end:
++                raise NotImplementedError(
++                    "Qwen4Exp N-gram PLE embedding requires every PLE layer to "
++                    f"live on pipeline rank 0 (layers {rank0_start}.."
++                    f"{rank0_end - 1}), but PLE layers are at {ple_idx}. Give "
++                    "rank 0 more layers via VLLM_PP_LAYER_PARTITION, or run "
++                    "with PP=1."
++                )
+         multimodal_config = vllm_config.model_config.multimodal_config
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+diff -ruN a/vllm/models/qwen4_exp/common/ngram_embedding.py b/vllm/models/qwen4_exp/common/ngram_embedding.py
+--- a/vllm/models/qwen4_exp/common/ngram_embedding.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/models/qwen4_exp/common/ngram_embedding.py	2026-09-26 16:02:09.870071349 +0700
+@@ -156,6 +156,24 @@
+         raise NotImplementedError
+ 
+ 
++def _ple_declared_unquantized(quant_config: object, prefix: str) -> bool:
++    """True hanya bila config checkpoint sendiri menyatakan tabel PLE ini tidak terkuantisasi.
++
++    Dipakai untuk checkpoint ber-body INC/auto-round dengan tabel PLE BF16 (mis. Intel
++    W4A16-AutoRound). Konservatif: ragu apa pun -> False -> pemanggil tetap raise.
++    """
++    parser = getattr(quant_config, "config_parser", None)
++    if parser is None or not hasattr(parser, "resolve"):
++        return False
++    try:
++        # layer=None adalah stand-in yang BENAR di sini: tabel PLE bukan ParallelLMHead
++        # dan bukan fused MoE — dua-duanya satu-satunya hal yang diperiksa resolver INC
++        # pada objek layer.
++        return not parser.resolve(None, prefix).quantized
++    except Exception:
++        return False
++
++
+ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
+     """Quantization interface shared by resident and pinned PLE tables."""
+ 
+@@ -182,6 +200,16 @@
+         ) and quant_config.is_layer_excluded(prefix):
+             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+         if not isinstance(quant_config, Fp8Config):
++            # Task 89 (gpu-1): body terkuantisasi (INC/auto-round) tetapi tabel PLE
++            # tidak. Checkpoint menyatakannya sendiri; gerbang untuk yang lain tetap.
++            if _ple_declared_unquantized(quant_config, prefix):
++                logger.info_once(
++                    "PLE embedding %s: %s declares the table unquantized, using the "
++                    "BF16 runtime method (gpu-1 Task 89)",
++                    prefix,
++                    type(quant_config).__name__,
++                )
++                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+             raise NotImplementedError(
+                 "Qwen4Exp PLE embedding does not support quantization config "
+                 f"{type(quant_config).__name__}"
+@@ -465,10 +493,19 @@
+ 
+         flat_ids = input_ids.reshape(-1).long()
+         if flat_ids.numel():
++            # Task 85 (port Ampere): Triton di sm<89 menolak tipe fp8e4nv. Kernel ini
++            # hanya MEMINDAHKAN byte (dequant terjadi belakangan), jadi untuk tabel FP8
++            # gather dilakukan dalam uint8: 1 byte/elemen -> indeks, stride, BLOCK_D,
++            # dan mask identik, hasil bit-exact, dan tipe fp8 tidak pernah lahir di Triton.
++            _lookup_weight = self._uva_weight
++            _lookup_output = output
++            if _lookup_weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                _lookup_weight = _lookup_weight.view(torch.uint8)
++                _lookup_output = _lookup_output.view(torch.uint8)
+             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
+-                self._uva_weight,
++                _lookup_weight,
+                 flat_ids,
+-                output,
++                _lookup_output,
+                 self.embedding_dim,
+                 self.shard_indices.org_vocab_start_index,
+                 self.shard_indices.org_vocab_end_index,
+diff -ruN a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py	2026-09-26 16:02:09.842072127 +0700
+@@ -32,13 +32,7 @@
+             self.ngram_eos_token_id = 0
+             return
+ 
+-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+-            raise RuntimeError(
+-                "N-gram PLE embedding currently requires "
+-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
+-                "not receive the raw input_ids required by PLE. Please run "
+-                "with PP=1."
+-            )
++        # vllm#54709: PP gate moved to config.py (placement-based).
+ 
+         self.ngram_context_len = int(config.ngram_size) - 1
+         if self.ngram_context_len <= 0:
+diff -ruN a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py	2026-09-26 16:02:09.813072933 +0700
+@@ -286,7 +286,13 @@
+         hidden_size = self.hidden_size
+         prev_block_output: torch.Tensor | None = None
+ 
+-        if get_pp_group().is_first_rank:
++        # Task 85 — cermin fix #2 PR #46994 (hulu menerapkannya di qwen3_5_mtp.py,
++        # bukan di sini). Drafter dibangun UTUH di stage PP terakhir, tempat
++        # is_first_rank False -> fc_embedding/fc_hidden terlewat dan alur jatuh ke
++        # cabang intermediate_tensors yang tidak pernah diisi. Bercabang pada
++        # tensornya sendiri: ekuivalen untuk modul terpipeline, benar untuk drafter
++        # utuh di satu rank.
++        if intermediate_tensors is None:
+             assert hidden_states is not None
+             if inputs_embeds is None:
+                 assert input_ids is not None
+diff -ruN a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py	2026-09-26 16:02:09.940069404 +0700
+@@ -17,6 +17,14 @@
+ 
+ 
+ @lru_cache(maxsize=1)
++def _fp8_kv_as_bytes() -> bool:
++    """gpu-1: True on sm<89, where Triton has no fp8e4nv and the fp8 KV cache
++    is decoded from raw uint8 bytes instead of being viewed as float8_e4m3fn."""
++    cap = current_platform.get_device_capability()
++    return cap is not None and cap.to_int() < 89
++
++
++@lru_cache(maxsize=1)
+ def _is_sm120() -> bool:
+     """True on sm_120 (RTX PRO 6000 Blackwell): selects the sm_120 tuning table."""
+     return current_platform.get_device_capability() == (12, 0)
+@@ -28,6 +36,33 @@
+     return current_platform.get_device_capability() == (9, 0)
+ 
+ 
++@triton.jit
++def _fp8_e4m3_bits_to_bf16(bits):
++    """Decode raw FP8 E4M3 (OCP e4m3fn) bytes to bf16 with 16-bit ops only.
++
++    gpu-1 Ampere port of vllm#55557: Triton on sm<89 rejects fp8e4nv, so the
++    cache stays uint8 there and is decoded in registers. For e>0:
++    bf16 = s | ((e+120)<<7) | (m<<4) = s | ((payload<<4) + 0x3C00).
++    Subnormals (e==0) are m * 2^-9. The writer saturates, so 0x7F (NaN) is
++    never stored. Bit-exact vs torch for all 256 codes.
++    """
++    b = bits.to(tl.int16)
++    payload = b & 0x7F
++    h_mag = ((payload << 4) + 0x3C00).to(tl.bfloat16, bitcast=True)
++    sub_mag = payload.to(tl.bfloat16) * 0.001953125
++    mag = tl.where(payload < 8, sub_mag, h_mag)
++    return (mag.to(tl.int16, bitcast=True) | ((b & 0x80) << 8)).to(
++        tl.bfloat16, bitcast=True
++    )
++
++
++def _kv_fp8_bytes_warps_stages(block_n: int, warps: int) -> tuple[int, int]:
++    """Launch shape for the Ampere byte path (gpu-1): wide tiles need 8 warps."""
++    if block_n > 16:
++        return 8, 1
++    return warps, 2
++
++
+ @triton.jit(do_not_specialize=["num_rows", "num_requests"])
+ def _qsa_sparse_paged_gqa_splitk_kernel(
+     q_ptr,
+@@ -70,6 +105,7 @@
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     IS_FP8: tl.constexpr,
++    KV_FP8_BYTES: tl.constexpr = False,
+ ) -> None:
+     row = tl.program_id(0)
+     kv_head = tl.program_id(1)
+@@ -150,7 +186,10 @@
+             mask=valid[:, None],
+             other=0.0,
+         )
+-        if IS_FP8:
++        if KV_FP8_BYTES:
++            # gpu-1 Ampere: uint8 e4m3 bytes -> bf16 (== keys.to(bf16) above sm89).
++            keys = _fp8_e4m3_bits_to_bf16(keys).to(query.dtype)
++        elif IS_FP8:
+             # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
+             # measured slower here and less accurate).
+             keys = keys.to(query.dtype)
+@@ -165,7 +204,10 @@
+         probabilities = tl.where(
+             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+         )
+-        if IS_FP8:
++        if KV_FP8_BYTES:
++            # gpu-1 Ampere: e4m3 -> bf16 -> fp16 is exact (== values.to(fp16)).
++            values = _fp8_e4m3_bits_to_bf16(values).to(tl.float16)
++        elif IS_FP8:
+             # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+             # softmax) so fp16 has the range, its wider mantissa is more
+             # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+@@ -636,7 +678,9 @@
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+     assert q.dtype == torch.bfloat16
+     assert k_cache.dtype == v_cache.dtype
+-    is_fp8 = k_cache.dtype == torch.float8_e4m3fn
++    # gpu-1 Ampere: a uint8 cache here means raw e4m3 bytes (sm<89 path).
++    kv_fp8_bytes = k_cache.dtype == torch.uint8
++    is_fp8 = kv_fp8_bytes or k_cache.dtype == torch.float8_e4m3fn
+     if is_fp8:
+         assert k_scale is not None and v_scale is not None
+         # Host pre-multiply: fold the K dequant scale into the attention scale
+@@ -674,6 +718,12 @@
+         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+     )
+ 
++    partial_stages = 2
++    if kv_fp8_bytes:
++        partial_warps, partial_stages = _kv_fp8_bytes_warps_stages(
++            block_n, partial_warps
++        )
++
+     # Split=1 writes output directly and compiles out all workspace accesses.
+     if num_splits == 1:
+         partial_output = out
+@@ -732,8 +782,9 @@
+         BLOCK_M=block_m,
+         BLOCK_N=block_n,
+         IS_FP8=is_fp8,
++        KV_FP8_BYTES=kv_fp8_bytes,
+         num_warps=partial_warps,
+-        num_stages=2,
++        num_stages=partial_stages,
+     )
+     if num_splits == 1:
+         return out
+@@ -771,6 +822,10 @@
+     # An fp8 cache is allocated as uint8 and viewed as e4m3 at attention time.
+     is_fp8 = kv_cache.dtype == torch.uint8
+     cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
++    # gpu-1 Ampere: sm<89 keeps the uint8 bytes (see Qwen4ExpQSAImpl.forward).
++    kv_fp8_bytes = is_fp8 and _fp8_kv_as_bytes()
++    if kv_fp8_bytes:
++        cache_dtype = torch.uint8
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+@@ -875,8 +930,15 @@
+             BLOCK_M=block_m,
+             BLOCK_N=block_n,
+             IS_FP8=is_fp8,
+-            num_warps=warps,
+-            num_stages=2,
++            KV_FP8_BYTES=kv_fp8_bytes,
++            num_warps=(
++                _kv_fp8_bytes_warps_stages(block_n, warps)[0]
++                if kv_fp8_bytes
++                else warps
++            ),
++            num_stages=(
++                _kv_fp8_bytes_warps_stages(block_n, warps)[1] if kv_fp8_bytes else 2
++            ),
+             grid=(num_rows, num_kv_heads, num_splits),
+         )
+         if num_splits > 1:
+Binary files a/vllm/models/qwen4_exp/nvidia/__pycache__/ngram_embedding.cpython-312.pyc and b/vllm/models/qwen4_exp/nvidia/__pycache__/ngram_embedding.cpython-312.pyc differ
+diff -ruN a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py	2026-09-26 16:02:09.782073794 +0700
+@@ -217,8 +217,12 @@
+         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+             # The cache is allocated as uint8; reinterpret the e4m3 bytes
+             # (same itemsize, so shape and strides are preserved).
+-            key_cache = key_cache.view(torch.float8_e4m3fn)
+-            value_cache = value_cache.view(torch.float8_e4m3fn)
++            from .ops.qsa import _fp8_kv_as_bytes
++
++            # gpu-1 Ampere: sm<89 keeps the raw bytes; the kernel decodes them.
++            if not _fp8_kv_as_bytes():
++                key_cache = key_cache.view(torch.float8_e4m3fn)
++                value_cache = value_cache.view(torch.float8_e4m3fn)
+             # Host-side per-tensor dequant scales (Python floats), as used by
+             # other host-scale backends; folded into the kernel's scales.
+             k_scale = layer._k_scale_float
+@@ -226,6 +230,7 @@
+         if query.dtype != torch.bfloat16 or key_cache.dtype not in (
+             torch.bfloat16,
+             torch.float8_e4m3fn,
++            torch.uint8,
+         ):
+             raise NotImplementedError(
+                 "Qwen4Exp QSA requires BF16 Q and BF16 or FP8-e4m3 K/V"
+diff -ruN a/vllm/v1/attention/backends/utils.py b/vllm/v1/attention/backends/utils.py
+--- a/vllm/v1/attention/backends/utils.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/v1/attention/backends/utils.py	2026-09-26 16:02:09.754074572 +0700
+@@ -259,9 +259,10 @@
+     """Resolve one KV cache layout for the whole model.
+ 
+     Runs once in the engine core. Every worker reports the layouts its backends
+-    support, most preferred first (``get_supported_kv_cache_layouts``); all
+-    ranks run the same backends, so their lists must agree. Specs mixing HNC
+-    shapes narrow the candidates to block-compact layouts. An explicit
++    support, most preferred first (``get_supported_kv_cache_layouts``); ranks
++    may expose different sets under pipeline parallelism, but their lists must
++    share at least one layout. Specs mixing HNC shapes narrow the candidates to
++    block-compact layouts. An explicit
+     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
+     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
+     connector's preference is used when compatible and dropped with a warning
+@@ -277,10 +278,16 @@
+     assert supported_layouts and all(supported_layouts), (
+         "No worker reported supported KV cache layouts."
+     )
+-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
+-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+-    )
+-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
++    common_layout_names = [
++        name
++        for name in supported_layouts[0]
++        if all(name in names for names in supported_layouts[1:])
++    ]
++    if not common_layout_names:
++        raise ValueError(
++            f"Workers share no supported KV cache layout: {supported_layouts}."
++        )
++    candidates = [_layout_from_name(name) for name in common_layout_names]
+ 
+     # A block-compact layout means the block is densely packed in memory, so any mix of
+     # specs can re-interpret HNC with different sizes as long as the total number of
+diff -ruN a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+--- a/vllm/v1/core/kv_cache_utils.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/v1/core/kv_cache_utils.py	2026-09-26 16:02:09.660077184 +0700
+@@ -1778,7 +1778,8 @@
+         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
+         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+             for layer_name, spec in group_spec.kv_cache_specs.items():
+-                layers_by_spec[spec].append(layer_name)
++                if layer_name in group.layer_names:
++                    layers_by_spec[spec].append(layer_name)
+         elif group.layer_names:
+             layers_by_spec[group_spec].extend(group.layer_names)
+ 
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-26 16:02:09.723075433 +0700
+@@ -1719,9 +1719,17 @@
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+             # boundary reset is visible to the attention metadata.
++            #
++            # Pass the SOURCE per-request-slot block tables, not the per-step
++            # gathered views: the mamba spec-decode context captures these
++            # tensors' raw data_ptrs exactly once and its copy kernels index rows
++            # by req_idx (mamba_utils.py). Gathered views are batch-ordered and
++            # are re-gathered every step, so under PP (max_concurrent_batches =
++            # pp_size + 1) a deferred postprocess on a non-last rank would walk
++            # another step's batch mapping through freed/reallocated block ids.
+             self.model_state.preprocess_state(
+                 input_batch,
+-                block_tables,
++                tuple(bt.gpu for bt in self.block_tables.block_tables),
+                 self.kv_cache_config,
+                 self.req_states.num_computed_tokens.gpu,
+             )
+diff -ruN a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py	2026-09-26 16:02:09.907070321 +0700
+@@ -139,7 +139,17 @@
+         kv_cache_config: KVCacheConfig,
+         mamba_group_ids: list[int],
+         block_tables: tuple[torch.Tensor, ...],
+-    ) -> MambaSpecDecodeGPUContext:
++        bind: bool = False,
++    ) -> tuple[MambaSpecDecodeGPUContext, bool]:
++        """Return the align context, optionally leaving it bound to ``block_tables``.
++
++        Only a caller holding the source per-request-slot tables may bind (pass
++        ``bind=True``). The copy kernels index rows by ``req_idx``, so a binding
++        taken from the per-step gathered views -- dummy runs, cudagraph capture --
++        would be read by every later launch. Such callers get a temporary binding
++        for the launch they are about to issue; the returned flag tells them to
++        release it afterwards (``ctx.is_initialized = False``).
++        """
+         if self._mamba_state_copy_funcs is None:
+             mamba_groups = get_mamba_groups(kv_cache_config)
+             mamba_types = {spec.mamba_type for spec in mamba_groups}
+@@ -163,6 +173,7 @@
+                 ),
+             )
+         ctx = self._mamba_ctx
++        temporary = False
+         if not ctx.is_initialized:
+             forward_context = self.vllm_config.compilation_config.static_forward_context
+             # block_tables are batch-order slices of the persistent
+@@ -174,7 +185,11 @@
+                 copy_funcs,
+                 [block_tables[gid] for gid in mamba_group_ids],
+             )
+-        return ctx
++            temporary = not bind
++        # ``temporary`` is only true when this call took the binding: a
++        # capture/dummy batch must not decide the tables every later copy kernel
++        # indexes by req_idx.
++        return ctx, temporary
+ 
+     def preprocess_state(
+         self,
+@@ -195,7 +210,14 @@
+         if num_reqs == 0:
+             return
+         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+-        ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
++        ctx, temporary = self._ensure_align_ctx(
++            kv_cache_config,
++            mamba_group_ids,
++            block_tables,
++            # Source per-request-slot tables: this call decides the binding.
++            bind=True,
++        )
++        assert not temporary, "preprocess_state binds the source block tables"
+ 
+         # The state-advance + pre-copy kernels run every step; they fast-exit per
+         # request when src_col < 0 or src_col == dst_col, so no copy happens on
+@@ -306,12 +328,20 @@
+                     if hasattr(builder, "mamba_aligned_state_indices"):
+                         aligned_index_builders.append((group_idx, builder))
+             if aligned_index_builders:
+-                ctx = self._ensure_align_ctx(
++                # prepare_attn only ever holds the per-step gathered views, so
++                # it must not decide the binding (bind defaults to False): it
++                # launches against a temporary binding and releases it, leaving
++                # the source tables to bind on the first real batch.
++                ctx, temporary = self._ensure_align_ctx(
+                     kv_cache_config, mamba_group_ids, block_tables
+                 )
+-                all_group_indices = ctx.compute_aligned_state_indices(
+-                    input_batch.seq_lens, num_reqs
+-                )
++                try:
++                    all_group_indices = ctx.compute_aligned_state_indices(
++                        input_batch.seq_lens, num_reqs, input_batch.idx_mapping
++                    )
++                finally:
++                    if temporary:
++                        ctx.is_initialized = False
+                 for group_idx, builder in aligned_index_builders:
+                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+ 
+diff -ruN a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+--- a/vllm/v1/worker/mamba_utils.py	2026-09-25 12:57:32.000000000 +0700
++++ b/vllm/v1/worker/mamba_utils.py	2026-09-26 16:02:09.630078018 +0700
+@@ -35,11 +35,19 @@
+ _TEMPORAL_TILES = 16
+ 
+ 
+-@triton.jit(do_not_specialize=["num_requests"])
++@triton.jit(do_not_specialize=["num_requests", "num_mapping_rows"])
+ def get_aligned_state_indices_multi_group_kernel(
+     block_table_ptrs_ptr,
+     seq_lens_ptr,
+     state_indices_ptr,
++    # Optional: batch_idx -> req_state_idx (V2 model runner / PP). The block
++    # tables bound to this context are the source request-state-slot tables, so
++    # the table row must be resolved through this mapping; seq_lens and the
++    # output stay in batch order.
++    idx_mapping_ptr,
++    # Entries in idx_mapping (real requests). Graph-capture batches pass a
++    # padded row count, so rows past this must not index into the mapping.
++    num_mapping_rows,
+     block_table_stride_req: tl.int64,
+     seq_lens_stride: tl.constexpr,
+     state_indices_stride_0: tl.constexpr,
+@@ -52,10 +60,25 @@
+     NUM_STATE_SLOTS: tl.constexpr,
+     BLOCK_STATE_SLOTS: tl.constexpr,
+     BLOCK_ROWS: tl.constexpr,
++    HAS_IDX_MAPPING: tl.constexpr = False,
+ ):
+     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+     valid_row = rows < num_requests
+ 
++    if HAS_IDX_MAPPING:
++        # idx_mapping only covers real requests; padded rows resolve to slot 0
++        # (the gathered-table path read a zeroed padding row there). The load
++        # index is clamped so the padded rows never read past the mapping.
++        safe_rows = tl.minimum(rows, tl.maximum(num_mapping_rows - 1, 0))
++        table_row = tl.load(
++            idx_mapping_ptr + safe_rows, mask=valid_row, other=0
++        ).to(tl.int64)
++        table_row = tl.where(rows < num_mapping_rows, table_row, 0)
++        active_row = valid_row & (table_row >= 0)
++    else:
++        table_row = rows
++        active_row = valid_row
++
+     seq_lens = tl.load(
+         seq_lens_ptr + rows * seq_lens_stride,
+         mask=valid_row,
+@@ -76,12 +99,12 @@
+     valid_state_slot = state_slots < NUM_STATE_SLOTS
+     state_indices = tl.load(
+         block_tables[:, None, None]
+-        + rows[None, :, None] * block_table_stride_req
++        + table_row[None, :, None] * block_table_stride_req
+         + first_state_slot[None, :, None]
+         + state_slots[None, None, :],
+         mask=(
+             valid_group[:, None, None]
+-            & valid_row[None, :, None]
++            & active_row[None, :, None]
+             & valid_state_slot[None, None, :]
+         ),
+     )
+@@ -93,7 +116,7 @@
+         state_indices,
+         mask=(
+             valid_group[:, None, None]
+-            & valid_row[None, :, None]
++            & active_row[None, :, None]
+             & valid_state_slot[None, None, :]
+         ),
+     )
+@@ -392,8 +415,9 @@
+     # Output: num_accepted_tokens update (for src==dst case)
+     num_accepted_tokens_out_ptr,
+     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
+-    # per-request decision arrays are in req-state-slot order; the block table
+-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
++    # per-request decision arrays AND the block tables are both in req-state-slot
++    # order, so rows are always indexed by req_idx; HAS_IDX_MAPPING only selects
++    # how a grid program (batch order) resolves its request slot.
+     idx_mapping_ptr,
+     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
+     num_reqs,
+@@ -476,7 +500,17 @@
+     if src_block_idx == dest_block_idx and accept_token_bias == 0:
+         return
+ 
+-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
++    # The captured block tables are the SOURCE per-request-slot tables
++    # (persistent [max_num_reqs, max_blocks], mutated only by stream-ordered
++    # staged writes), so rows are always request-state slots -- index them by
++    # req_idx. Indexing by batch row read the CURRENT step's table at a stale
++    # batch mapping: on a non-last PP rank the deferred postprocess runs
++    # pp_size steps after its batch was gathered, so batch rows point at
++    # DIFFERENT requests and the state copy walks another request's
++    # freed/reallocated block ids. In the CSA unified layout every cache
++    # tensor aliases the same page, which is how foreign bytes landed in the
++    # PLE conv state (all-NaN logits -> constant-token loops; vllm#54173).
++    bt_row_idx = req_idx
+     _copy_mamba_state_block(
+         state_idx,
+         bt_row_idx,
+@@ -610,7 +644,8 @@
+     token_bias = tl.load(token_bias_ptr + req_idx)
+     _copy_mamba_state_block(
+         state_idx,
+-        batch_idx,
++        # Source tables are req-indexed (see postprocess_mamba_fused_kernel).
++        req_idx,
+         src_col,
+         dst_col,
+         token_bias,
+@@ -1093,13 +1128,30 @@
+         self,
+         seq_lens: torch.Tensor,
+         num_reqs: int,
++        idx_mapping: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """Compute every Mamba group's aligned physical state IDs in one launch."""
++        """Compute every Mamba group's aligned physical state IDs in one launch.
++
++        Args:
++            seq_lens: [num_reqs] batch-ordered sequence lengths.
++            num_reqs: rows to fill. FULL-graph batches pass the padded request
++                count, which may exceed the number of real requests.
++            idx_mapping: optional [num_reqs_real] batch_idx -> req_state_idx,
++                covering real requests only. The block tables bound to this
++                context are the source request-state-slot tables (see
++                ``initialize_from_forward_context``), so the table row is resolved
++                through this mapping; None means the batch order already equals
++                the request-state order (V1).
++        """
+         assert self.is_initialized
+         assert seq_lens.is_cuda
+         assert 0 <= num_reqs <= seq_lens.shape[0]
+         assert self.aligned_state_indices is not None
+         assert num_reqs <= self.aligned_state_indices.shape[1]
++        if idx_mapping is not None:
++            assert idx_mapping.numel() <= num_reqs, (
++                "idx_mapping covers real requests; num_reqs counts padded rows"
++            )
+         if num_reqs == 0:
+             return self.aligned_state_indices[:, :0]
+ 
+@@ -1110,6 +1162,8 @@
+             self.block_table_ptrs,
+             seq_lens,
+             self.aligned_state_indices,
++            idx_mapping,
++            0 if idx_mapping is None else idx_mapping.numel(),
+             self.block_table_stride_req,
+             seq_lens.stride(0),
+             self.aligned_state_indices.stride(0),
+@@ -1122,6 +1176,7 @@
+             NUM_STATE_SLOTS=num_state_slots,
+             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
+             BLOCK_ROWS=block_rows,
++            HAS_IDX_MAPPING=idx_mapping is not None,
+             num_warps=1,
+         )
+         return self.aligned_state_indices[:, :num_reqs]

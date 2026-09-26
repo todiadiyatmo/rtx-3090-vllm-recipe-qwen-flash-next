@@ -52,10 +52,10 @@ The two generic files below take any checkpoint via `MODEL_DIR` and are what the
 Intel cannot use the MTP files: it ships `model_extra_tensors.safetensors` (a BF16 draft head), not the
 `mtp-model-*.safetensors` this vLLM loads.
 
-vLLM is pinned to nightly **`eed1f3d0c6043bd494424a22443ee198dd56f657`** (12 Sep 2026, image
-`vllm/vllm-openai:nightly-eed1f3d0c604…`, digest `sha256:d0742e7e…`) plus the patches in the next section, built locally as
-`local/qwen38-flash-next:eed1f3d0-ampere-pp-mtp`. The image reports its own version as `0.1.1.dev50+geed1f3d0c`; the commit
-hash is the identity. MTP needs the checkpoint revision that ships `mtp-model-*.safetensors` (13 Sep 2026 or later).
+vLLM is pinned to nightly **`29468dde8b515031dc6d4d9d06bf0a2fa0442098`** (25 Sep 2026, image
+`vllm/vllm-openai:nightly-29468dde8b51…`, digest `sha256:c718e2d7…`) plus the patches in the next section, built locally as
+`local/qwen38-flash-next:29468dde-ampere-pp-mtp`. The image reports its own version as `0.30.1rc1.dev143+g29468dde8`; the
+commit hash is the identity. MTP needs the checkpoint revision that ships `mtp-model-*.safetensors` (13 Sep 2026 or later).
 
 **Why TP2 × PP2 instead of TP4?** The model has only **two KV heads**, so its KV cache can be split across
 two GPUs, not four. With **TP4**, the heads have to be duplicated across GPUs rather than split further.
@@ -75,26 +75,25 @@ The base image is stock; the overlay replaces 11 source files (full detail, upst
 
 | Change | Purpose |
 |---|---|
-| [#54846](https://github.com/vllm-project/vllm/pull/54846), manually ported | FP8 KV cache on the QSA (sparse attention) path. |
-| **Local: Ampere `KV_FP8_BYTES` byte path** | RTX 3090 has no FP8 tensor cores and Triton has no fp8 type on sm86, so the cache is stored as raw E4M3 bytes and decoded to BF16 in kernel registers. |
+| **Local: Ampere byte path for upstream FP8 KV ([#55557](https://github.com/vllm-project/vllm/pull/55557))** | FP8 KV on the QSA path is upstream now, but its kernel loads the cache as `float8_e4m3fn`, which Triton rejects on sm86. On sm<89 the cache stays raw E4M3 bytes and is decoded in kernel registers (bit-exact for all finite codes). |
 | **Local: Ampere FP8 PLE lookup** | Upstream's pinned-host PLE lookup kernel refuses fp8 on sm86. The kernel only copies bytes, so the gather runs as `uint8`; the result is bit-identical. |
 | Local fix for [#54709](https://github.com/vllm-project/vllm/issues/54709) | Placement-aware PLE checks so PP>1 is accepted. |
 | [#54793](https://github.com/vllm-project/vllm/pull/54793) | Handle empty KV groups under PP. |
 | [#54795](https://github.com/vllm-project/vllm/pull/54795) | Intersect compatible KV layouts across workers. |
 | **Local mirror of [#46994](https://github.com/vllm-project/vllm/pull/46994) for `qwen4_exp`** | Upstream enables MTP under PP but fixes the draft head only for `qwen3_5_mtp`. Without this 3-line fix the `qwen4_exp` drafter skips its `fc` projections on the last stage. |
 | **Local: PLE gate for unquantized tables** | `from_quant_config` has no branch for "body quantized by INC, PLE table not quantized", so an INC/auto-round checkpoint with a BF16 PLE table (e.g. the Intel checkpoint) dies at boot with `NotImplementedError ... INCConfig`. Adds one branch that trusts the checkpoint's own INC rule (`.*ple.*` = 16-bit float); anything not provably unquantized still raises. Upstream-bound. |
-| [#55506](https://github.com/vllm-project/vllm/pull/55506), **still open upstream** | Index the mamba spec-decode block tables by request slot, not batch row. Without it, PP + MTP + prefix caching poisons recurrent state and a share of requests loop on one token forever. Added after the v1.1.0 validation and measured on its own — see [Known failure modes](#known-failure-modes). |
+| [#55506](https://github.com/vllm-project/vllm/pull/55506) (25 Sep revision), **still open upstream** | Index the mamba spec-decode block tables by request slot, not batch row. Without it, PP + MTP + prefix caching poisons recurrent state and a share of requests loop on one token forever. Added after the v1.1.0 validation and measured on its own — see [Known failure modes](#known-failure-modes). |
 
 Already in the base (patches in the previous recipe, not needed any more): #53899 host-resident PLE table, FP8 PLE table
 loading with `--quantization inc`, #55375 fused-PLE stride fix, #55745 draft-broadcast stream guard, #46994 MTP under PP.
 
-`recipe/patch/SHA256SUMS` records the overlay hashes; `nightly-eed1f3d0-flashnext-mtp.patch` (9 files),
-`pr55506-mamba-spec-block-table-req-slot.patch` (2 files) and `ple-inc-bf16-gate.patch` (1 file, applies on top of the
-first) are the same changes as unified diffs for audit/rebase (the
+`recipe/patch/SHA256SUMS` records the overlay hashes; `nightly-29468dde-flashnext-mtp.patch` (all 11 files) is the
+same change as one unified diff, and `pr55506-mamba-spec-block-table-req-slot.patch` (3 files) and
+`ple-inc-bf16-gate.patch` (1 file) isolate those two changes, for audit/rebase (the
 Dockerfile copies the overlay and does **not** apply the diffs; do not do both).
 
 ```bash
-docker build -t local/qwen38-flash-next:eed1f3d0-ampere-pp-mtp recipe/patch
+docker build -t local/qwen38-flash-next:29468dde-ampere-pp-mtp recipe/patch
 ( cd recipe/patch && sha256sum -c SHA256SUMS )
 ```
 
@@ -151,10 +150,10 @@ because its main bottleneck is reading model weights from GPU memory, not transf
 
 | Setting | Value | Notes |
 |---|---|---|
-| Engine | vLLM nightly `eed1f3d0`, patched | Ampere FP8 KV and FP8 PLE lookup, pipeline-parallel fixes, MTP draft-head fix; not stock vLLM |
+| Engine | vLLM nightly `29468dde`, patched | Ampere FP8 KV and FP8 PLE lookup, pipeline-parallel fixes, MTP draft-head fix; not stock vLLM |
 | Parallelism | TP=2 × PP=2, expert parallel | `--enable-expert-parallel` (required: 640-wide MoE intermediate is not divisible by group 128 under TP4) |
 | Weights / activations | `--quantization inc --dtype bfloat16` | BF16 activations; INT4 experts via Marlin, INT8 projections via AllSpark |
-| PLE table | host RAM | `VLLM_PLE_CPU_OFFLOAD=1` (still honored by this vLLM, logged as legacy; upstream name is `--engram-config.cpu_offload`) |
+| PLE table | host RAM | `--engram-config '{"cpu_offload": true}'` (the old `VLLM_PLE_CPU_OFFLOAD` env var is ignored by this vLLM without a warning) |
 | KV cache | FP8 | `--kv-cache-dtype fp8_e4m3` (Ampere byte path from the patch set) |
 | Context limit | 262,144 tokens | `--max-model-len 262144` (the checkpoint's native ceiling) |
 | GPU memory utilization | 0.94 | `--gpu-memory-utilization 0.94`; 0.95 left <650 MiB free on stage 0 |
@@ -266,6 +265,10 @@ For the other scripts, use a proxy that adds the
 
 Version names are internal to this repository and point at the vLLM image the recipe was built with.
 
+- **v1.4.0-29468dde — 26 Sep 2026.** vLLM nightly `29468dde` (25 Sep 2026). Decode and quality on par with v1.3.0,
+  KV pool +1%, cold prefill −3 to −4%. `VLLM_PLE_CPU_OFFLOAD` is silently ignored on this base: use
+  `--engram-config '{"cpu_offload": true}'`. Upstream's FP8 QSA KV cache does not compile on sm_86 without this
+  recipe's byte-decode patch.
 - **v1.3.0-eed1f3d0 — 21 Sep 2026.** Same base image as v1.2.0, one more overlay change: the **PLE gate**
   now accepts an unquantized PLE table on an INC-quantized checkpoint. Without it,
   [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) —

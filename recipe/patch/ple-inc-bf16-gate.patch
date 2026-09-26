@@ -1,6 +1,6 @@
---- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-+++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
-@@ -158,6 +158,24 @@
+--- a/vllm/models/qwen4_exp/common/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/common/ngram_embedding.py
+@@ -156,6 +156,24 @@
          raise NotImplementedError
  
  
@@ -25,7 +25,7 @@
  class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
      """Quantization interface shared by resident and pinned PLE tables."""
  
-@@ -184,6 +202,16 @@
+@@ -182,6 +200,16 @@
          ) and quant_config.is_layer_excluded(prefix):
              return Qwen4ExpPLEUnquantizedEmbeddingMethod()
          if not isinstance(quant_config, Fp8Config):

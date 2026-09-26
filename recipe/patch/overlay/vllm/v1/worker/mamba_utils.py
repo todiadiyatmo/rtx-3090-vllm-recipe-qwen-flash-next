@@ -26,8 +26,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
-from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
 
@@ -36,11 +35,19 @@ logger = init_logger(__name__)
 _TEMPORAL_TILES = 16
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_mapping_rows"])
 def get_aligned_state_indices_multi_group_kernel(
     block_table_ptrs_ptr,
     seq_lens_ptr,
     state_indices_ptr,
+    # Optional: batch_idx -> req_state_idx (V2 model runner / PP). The block
+    # tables bound to this context are the source request-state-slot tables, so
+    # the table row must be resolved through this mapping; seq_lens and the
+    # output stay in batch order.
+    idx_mapping_ptr,
+    # Entries in idx_mapping (real requests). Graph-capture batches pass a
+    # padded row count, so rows past this must not index into the mapping.
+    num_mapping_rows,
     block_table_stride_req: tl.int64,
     seq_lens_stride: tl.constexpr,
     state_indices_stride_0: tl.constexpr,
@@ -53,9 +60,24 @@ def get_aligned_state_indices_multi_group_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
+
+    if HAS_IDX_MAPPING:
+        # idx_mapping only covers real requests; padded rows resolve to slot 0
+        # (the gathered-table path read a zeroed padding row there). The load
+        # index is clamped so the padded rows never read past the mapping.
+        safe_rows = tl.minimum(rows, tl.maximum(num_mapping_rows - 1, 0))
+        table_row = tl.load(
+            idx_mapping_ptr + safe_rows, mask=valid_row, other=0
+        ).to(tl.int64)
+        table_row = tl.where(rows < num_mapping_rows, table_row, 0)
+        active_row = valid_row & (table_row >= 0)
+    else:
+        table_row = rows
+        active_row = valid_row
 
     seq_lens = tl.load(
         seq_lens_ptr + rows * seq_lens_stride,
@@ -77,12 +99,12 @@ def get_aligned_state_indices_multi_group_kernel(
     valid_state_slot = state_slots < NUM_STATE_SLOTS
     state_indices = tl.load(
         block_tables[:, None, None]
-        + rows[None, :, None] * block_table_stride_req
+        + table_row[None, :, None] * block_table_stride_req
         + first_state_slot[None, :, None]
         + state_slots[None, None, :],
         mask=(
             valid_group[:, None, None]
-            & valid_row[None, :, None]
+            & active_row[None, :, None]
             & valid_state_slot[None, None, :]
         ),
     )
@@ -94,7 +116,7 @@ def get_aligned_state_indices_multi_group_kernel(
         state_indices,
         mask=(
             valid_group[:, None, None]
-            & valid_row[None, :, None]
+            & active_row[None, :, None]
             & valid_state_slot[None, None, :]
         ),
     )
@@ -417,8 +439,7 @@ def postprocess_mamba_fused_kernel(
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
 ):
-    """
-    Fused GPU kernel for postprocess_mamba that computes decisions AND performs
+    """Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
 
     Grid: (num_reqs, num_states [, TEMPORAL_TILES])
@@ -782,8 +803,7 @@ class MambaCopyBuffers:
 
 @dataclasses.dataclass
 class MambaSpecDecodeGPUContext:
-    """
-    Context for GPU-side Mamba state copy operations during the
+    """Context for GPU-side Mamba state copy operations during the
     fused postprocess path.
 
     Only used when speculative decoding is enabled on a hybrid model
@@ -940,8 +960,7 @@ class MambaSpecDecodeGPUContext:
         mamba_state_copy_funcs: MambaStateCopyFuncsByType,
         block_tables: list[torch.Tensor],
     ) -> None:
-        """
-        Extract and cache memory layout metadata from Mamba state tensors.
+        """Extract and cache memory layout metadata from Mamba state tensors.
 
         This method populates the pre-allocated metadata tensors with information
         needed by `postprocess_mamba_fused_kernel` to perform state copies entirely
@@ -973,6 +992,7 @@ class MambaSpecDecodeGPUContext:
             block_tables: per-mamba-group persistent block-table tensors, in
                 the same order as `mamba_group_ids`. Their `data_ptr()` /
                 `stride(0)` are captured once for the kernel to index into.
+
         """
         if self.is_initialized:
             return
@@ -1108,13 +1128,30 @@ class MambaSpecDecodeGPUContext:
         self,
         seq_lens: torch.Tensor,
         num_reqs: int,
+        idx_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """compute every Mamba group's aligned physical state IDs in one launch."""
+        """Compute every Mamba group's aligned physical state IDs in one launch.
+
+        Args:
+            seq_lens: [num_reqs] batch-ordered sequence lengths.
+            num_reqs: rows to fill. FULL-graph batches pass the padded request
+                count, which may exceed the number of real requests.
+            idx_mapping: optional [num_reqs_real] batch_idx -> req_state_idx,
+                covering real requests only. The block tables bound to this
+                context are the source request-state-slot tables (see
+                ``initialize_from_forward_context``), so the table row is resolved
+                through this mapping; None means the batch order already equals
+                the request-state order (V1).
+        """
         assert self.is_initialized
         assert seq_lens.is_cuda
         assert 0 <= num_reqs <= seq_lens.shape[0]
         assert self.aligned_state_indices is not None
         assert num_reqs <= self.aligned_state_indices.shape[1]
+        if idx_mapping is not None:
+            assert idx_mapping.numel() <= num_reqs, (
+                "idx_mapping covers real requests; num_reqs counts padded rows"
+            )
         if num_reqs == 0:
             return self.aligned_state_indices[:, :0]
 
@@ -1125,6 +1162,8 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs,
             seq_lens,
             self.aligned_state_indices,
+            idx_mapping,
+            0 if idx_mapping is None else idx_mapping.numel(),
             self.block_table_stride_req,
             seq_lens.stride(0),
             self.aligned_state_indices.stride(0),
@@ -1137,6 +1176,7 @@ class MambaSpecDecodeGPUContext:
             NUM_STATE_SLOTS=num_state_slots,
             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
             BLOCK_ROWS=block_rows,
+            HAS_IDX_MAPPING=idx_mapping is not None,
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]
@@ -1150,8 +1190,7 @@ class MambaSpecDecodeGPUContext:
         num_computed_tokens_gpu: torch.Tensor,
         num_draft_tokens_gpu: torch.Tensor,
     ) -> None:
-        """
-        Run the fused postprocess_mamba kernel on GPU.
+        """Run the fused postprocess_mamba kernel on GPU.
 
         This computes decisions and performs mamba state copies entirely on GPU,
         eliminating the CPU-GPU sync that was previously needed.
@@ -1163,6 +1202,7 @@ class MambaSpecDecodeGPUContext:
             num_scheduled_tokens_gpu: [num_reqs] scheduled token counts
             num_computed_tokens_gpu: [num_reqs] computed token counts
             num_draft_tokens_gpu: [num_reqs] draft token counts
+
         """
         if num_reqs == 0 or not self.is_initialized:
             return
@@ -1218,6 +1258,7 @@ class MambaSpecDecodeGPUContext:
             token_bias_gpu: [max_reqs] accepted-token bias (num_accepted - 1).
             idx_mapping: optional [num_reqs] batch_idx -> req_state_idx.
                 None means V1 batch order already equals request state order.
+
         """
         if num_reqs == 0 or not self.is_initialized:
             return
@@ -1448,15 +1489,14 @@ def preprocess_mamba(
     kv_cache_config: KVCacheConfig,
     cache_config: CacheConfig,
     mamba_state_idx: dict[str, int],
-    input_batch: GPUInputBatch,
+    input_batch: InputBatch,
     requests: dict[str, CachedRequestState],
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     copy_bufs: MambaCopyBuffers,
     align_ctx: MambaSpecDecodeGPUContext | None = None,
 ):
-    """
-    Copy the mamba state of previous step to the last
+    """Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
     """
     fused = _resolve_fused_precopy(align_ctx)
@@ -1553,7 +1593,7 @@ def preprocess_mamba(
 def postprocess_mamba_all(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
-    input_batch: GPUInputBatch,
+    input_batch: InputBatch,
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
     num_spec_tokens: int,
@@ -1584,7 +1624,7 @@ def postprocess_mamba_all(
 
 def preprocess_mamba_all_specdec(
     scheduler_output: SchedulerOutput,
-    input_batch: GPUInputBatch,
+    input_batch: InputBatch,
     mamba_state_idx: dict[str, int],
     num_reqs: int,
     prev_last_scheduled_idx_buf: CpuGpuBuffer,
@@ -1603,7 +1643,7 @@ def postprocess_mamba_align_gpu(
     num_reqs: int,
     num_accepted_tokens_gpu: torch.Tensor,
     num_accepted_tokens_cpu_tensor: torch.Tensor,
-    input_batch: GPUInputBatch,
+    input_batch: InputBatch,
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,

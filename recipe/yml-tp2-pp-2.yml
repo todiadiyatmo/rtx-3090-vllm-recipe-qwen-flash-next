@@ -4,7 +4,7 @@ name: rtx3090x4-qwen38-recipe
 
 services:
   vllm:
-    image: ${VLLM_IMAGE:-local/qwen38-flash-next:eed1f3d0-ampere-pp-mtp}
+    image: ${VLLM_IMAGE:-local/qwen38-flash-next:29468dde-ampere-pp-mtp}
     build:
       context: ./recipe/patch
       dockerfile: Dockerfile
@@ -44,7 +44,7 @@ services:
         bind:
           create_host_path: false
       - ./cache/huggingface:/root/.cache/huggingface
-      - ./cache/torch_compile-eed1f3d0:/root/.cache/vllm/torch_compile_cache
+      - ./cache/torch_compile-29468dde:/root/.cache/vllm/torch_compile_cache
       - ./cache/triton:/root/.triton/cache
       - ./cache/torch_kernels:/root/.cache/torch
     environment:
@@ -53,8 +53,6 @@ services:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       CUDA_VISIBLE_DEVICES: "0,1,2,3"
-      # Host-resident PLE table. Still honored by this vLLM (logged as legacy); tested form.
-      VLLM_PLE_CPU_OFFLOAD: "1"
       VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
       PYTORCH_ALLOC_CONF: expandable_segments:True
@@ -71,6 +69,8 @@ services:
       - /models/model
       - --quantization
       - inc
+      # Host-resident PLE table. On this vLLM the old VLLM_PLE_CPU_OFFLOAD env var is ignored without a warning.
+      - '--engram-config={"cpu_offload": true}'
       - --served-model-name
       - ${SERVED_MODEL_NAME:-qwen38-flash-next}
       - --dtype
