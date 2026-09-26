@@ -152,7 +152,7 @@ because its main bottleneck is reading model weights from GPU memory, not transf
 |---|---|---|
 | Engine | vLLM nightly `29468dde`, patched | Ampere FP8 KV and FP8 PLE lookup, pipeline-parallel fixes, MTP draft-head fix; not stock vLLM |
 | Parallelism | TP=2 × PP=2, expert parallel | `--enable-expert-parallel` (required: 640-wide MoE intermediate is not divisible by group 128 under TP4) |
-| Weights / activations | `--quantization inc --dtype bfloat16` | BF16 activations; INT4 experts via Marlin, INT8 projections via AllSpark |
+| Weights / activations | `--quantization inc --dtype bfloat16` | BF16 activations; INT4 experts via Marlin, INT8 projections via Marlin W8A16 (AllSpark up to v1.3.0; removed upstream in [vllm#58001](https://github.com/vllm-project/vllm/pull/58001)) |
 | PLE table | host RAM | `--engram-config '{"cpu_offload": true}'` (the old `VLLM_PLE_CPU_OFFLOAD` env var is ignored by this vLLM without a warning) |
 | KV cache | FP8 | `--kv-cache-dtype fp8_e4m3` (Ampere byte path from the patch set) |
 | Context limit | 262,144 tokens | `--max-model-len 262144` (the checkpoint's native ceiling) |
@@ -268,7 +268,9 @@ Version names are internal to this repository and point at the vLLM image the re
 - **v1.4.0-29468dde — 26 Sep 2026.** vLLM nightly `29468dde` (25 Sep 2026). Decode and quality on par with v1.3.0,
   KV pool +1%, cold prefill −3 to −4%. `VLLM_PLE_CPU_OFFLOAD` is silently ignored on this base: use
   `--engram-config '{"cpu_offload": true}'`. Upstream's FP8 QSA KV cache does not compile on sm_86 without this
-  recipe's byte-decode patch.
+  recipe's byte-decode patch. vLLM removed the AllSpark INT8 kernel
+  ([#58001](https://github.com/vllm-project/vllm/pull/58001)); the INT8 projections now run on Marlin W8A16, the likely
+  source of the prefill difference (not yet isolated).
 - **v1.3.0-eed1f3d0 — 21 Sep 2026.** Same base image as v1.2.0, one more overlay change: the **PLE gate**
   now accepts an unquantized PLE table on an INC-quantized checkpoint. Without it,
   [Intel/Qwen3.8-Flash-Next-W4A16-AutoRound](https://huggingface.co/Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) —
@@ -302,7 +304,8 @@ Version names are internal to this repository and point at the vLLM image the re
 - [klee100](https://huggingface.co/klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP) — the 4-bit/8-bit MTP draft head reused in the checkpoint (only its MTP shards).
 - [RadixArk](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) — original FP8 PLE lookup weights (only the PLE table is reused, not the NVFP4 backbone), obtained through [albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE](https://huggingface.co/albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE).
 - [vLLM](https://github.com/vllm-project/vllm) and the authors of the upstream PRs listed above, whose code the overlay carries.
-- Alibaba [DashInfer](https://github.com/modelscope/dash-infer) team — the AllSpark W8A16 kernel (in vLLM) that serves the INT8 projections on Ampere.
+- Alibaba [DashInfer](https://github.com/modelscope/dash-infer) team — the AllSpark W8A16 kernel (in vLLM) that served the INT8 projections on Ampere through v1.3.0.
+- [IST-DASLab](https://github.com/IST-DASLab/marlin) and Neural Magic — the Marlin kernels (in vLLM) that serve the INT4 experts and, from v1.4.0, the INT8 projections.
 - [peculiar-ragdoll / Sharp](https://huggingface.co/peculiar-ragdoll/Qwen-Sharp-Chat-Templates), building on [froggeric](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) — chat template.
 - [noonghunna/club-3090](https://github.com/noonghunna/club-3090) — community recipes and the benchmark harness used here.
 - [aikitoria/open-gpu-kernel-modules](https://github.com/aikitoria/open-gpu-kernel-modules), building on tinygrad's work — optional driver-level P2P.
